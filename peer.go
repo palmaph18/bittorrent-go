@@ -133,16 +133,18 @@ func (p *Peer) handleConnection(conn net.Conn) {
 func (p *Peer) UpdateProgress(newProgress float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.DownloadStatus = newProgress
 
-	// Regla de distribución: compartir automáticamente al superar el 20% de descarga
-	if p.DownloadStatus > 20.0 && p.Role == "Leecher" {
-		fmt.Println("\n[*] Progreso superó el 20%. Comenzando a compartir fragmentos hacia la red...")
-		// Aquí se activaría la lógica para permitir cargas (uploads).
+	// Detectar el cruce exacto del 20% para imprimirlo solo una vez
+	if p.DownloadStatus <= 20.0 && newProgress > 20.0 && p.Role == "Leecher" {
+		fmt.Printf("\n[*] Progreso superó el 20%%. Comenzando a compartir fragmentos...\n")
 	}
 
-	// Roles dinámicos: cambia a Seeder si posee el archivo completo
-	if p.DownloadStatus == 100.0 && p.Role != "Seeder" {
+	p.DownloadStatus = newProgress
+
+	// Imprimir el porcentaje continuo sobrescribiendo la misma línea
+	fmt.Printf("\r[Descarga] Progreso actual: %.2f%%", p.DownloadStatus)
+
+	if p.DownloadStatus >= 100.0 && p.Role != "Seeder" {
 		p.Role = "Seeder"
 		fmt.Println("\n[*] Descarga completa al 100%. Rol cambiado dinámicamente a Seeder.")
 	}
@@ -254,51 +256,98 @@ func (p *Peer) cliMenu() {
 	}
 }
 
-// startDownload conecta directamente con un Seeder, solicita los pedazos y los ensambla en disco
+// startDownload conecta con un Seeder, solicita pedazos y aplica Tolerancia a Fallos
 func (p *Peer) startDownload(metadata *TorrentMetadata) {
 	fmt.Printf("\n[*] Iniciando descarga binaria del archivo: %s\n", metadata.FileName)
-	seederAddr := "127.0.0.1:4000" // Mantendremos el Seeder local para esta prueba
+	seederAddr := "127.0.0.1:4000"
+	totalPieces := len(metadata.PiecesHashes)
 
-	// Crear el archivo de destino localmente agregando un prefijo para no sobrescribir el original
+	// 1. Cargar estado previo usando las funciones de tu connection.go
+	state, err := LoadProgress(metadata.FileName, totalPieces)
+	if err != nil {
+		fmt.Printf("[ERROR] No se pudo cargar el estado local: %v\n", err)
+		return
+	}
+
+	if state.ProgressStatus > 0 {
+		fmt.Printf("[*] Tolerancia a fallos activa: Retomando descarga desde el %.2f%%\n", state.ProgressStatus)
+		p.UpdateProgress(state.ProgressStatus)
+	}
+
 	destPath := filepath.Join("archivos", "descargado_"+metadata.FileName)
 	file, err := os.OpenFile(destPath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
-		fmt.Printf("[ERROR] No se pudo crear el archivo local: %v\n", err)
 		return
 	}
 	defer file.Close()
 
 	conn, err := net.Dial("tcp", seederAddr)
 	if err != nil {
-		fmt.Printf("[ERROR] No se pudo conectar al Seeder P2P: %v\n", err)
+		fmt.Printf("[ERROR] No se pudo conectar al Seeder: %v\n", err)
 		return
 	}
 	defer conn.Close()
 
-	totalPieces := len(metadata.PiecesHashes)
 	encoder := gob.NewEncoder(conn)
 	decoder := gob.NewDecoder(conn)
 
+	// 2. Ciclo de descarga de pedazos
 	for i := 0; i < totalPieces; i++ {
-		// El payload incluye el nombre del archivo y el índice del pedazo (ej. "archivo.mp4|3")
+		if state.Downloaded[i] {
+			continue // Saltar pedazos ya descargados (Tolerancia a fallos)
+		}
+
 		payload := fmt.Sprintf("%s|%d", metadata.FileName, i)
 		req := Message{Type: REQUEST_PIECE, Payload: []byte(payload)}
-
-		if err := encoder.Encode(&req); err != nil {
-			fmt.Printf("[ERROR] Fallo al solicitar pedazo %d: %v\n", i, err)
-			break
-		}
+		encoder.Encode(&req)
 
 		var resp Message
 		if err := decoder.Decode(&resp); err == nil && resp.Type == PIECE_DATA {
-			// Escribir los bytes recibidos en el offset correcto del archivo
 			offset := int64(i * metadata.PieceLength)
 			file.WriteAt(resp.Payload, offset)
 
-			// Actualizar progreso dinámicamente y aplicar regla de distribución
-			progress := (float64(i+1) / float64(totalPieces)) * 100
+			// Registrar pedazo y calcular progreso
+			state.Downloaded[i] = true
+
+			// Guardar el estado en disco usando tu función SaveProgress
+			SaveProgress(metadata.FileName, state.Downloaded, totalPieces)
+
+			// Calcular progreso local iterando tu slice de booleanos
+			completed := 0
+			for _, done := range state.Downloaded {
+				if done {
+					completed++
+				}
+			}
+			progress := (float64(completed) / float64(totalPieces)) * 100
 			p.UpdateProgress(progress)
+		} else {
+			fmt.Println("\n[!] Conexión interrumpida con el Seeder.")
+			break // Romper ciclo si falla la red, el estado ya está guardado
 		}
 	}
-	fmt.Printf("\n[*] ¡Descarga P2P completada! Archivo guardado en: %s\n", destPath)
+
+	// 3. Verificar si el archivo está completo para notificar al Tracker
+	allDone := true
+	for _, done := range state.Downloaded {
+		if !done {
+			allDone = false
+			break
+		}
+	}
+
+	if allDone {
+		fmt.Printf("\n[*] ¡Descarga P2P completada! Archivo en: %s\n", destPath)
+
+		// Conectar al Tracker para registrar el nuevo rol de Seeder público
+		connTracker, errTracker := net.Dial("tcp", p.TrackerAddr)
+		if errTracker == nil {
+			payload := fmt.Sprintf("%s|%d|%s|%.2f", metadata.FileName, p.Port, p.Role, p.DownloadStatus)
+			msg := Message{Type: REGISTER_TORRENT, Payload: []byte(payload)}
+			encTracker := gob.NewEncoder(connTracker)
+			encTracker.Encode(&msg)
+			connTracker.Close()
+			fmt.Println("[*] Tracker notificado: Ahora eres un Seeder público.")
+		}
+	}
 }

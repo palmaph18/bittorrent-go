@@ -116,7 +116,6 @@ func (t *Tracker) handleConnection(conn net.Conn) {
 		fmt.Printf("\n[*] Nuevo Peer registrado. Puerto asignado: %d\n", port)
 
 	case REGISTER_TORRENT:
-		// Extraer datos del payload separados por '|'
 		parts := strings.Split(string(msg.Payload), "|")
 		if len(parts) == 4 {
 			torrentHash := parts[0]
@@ -127,15 +126,16 @@ func (t *Tracker) handleConnection(conn net.Conn) {
 			role := parts[2]
 			fmt.Sscanf(parts[3], "%f", &dlStatus)
 
-			// Obtener IP real
 			peerIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 
-			// Escribir en el mapa global con sincronización
+			// NUEVO: Identificador único usando IP + Puerto (ej. 127.0.0.1:4000)
+			peerID := fmt.Sprintf("%s:%d", peerIP, port)
+
 			t.mu.Lock()
 			if _, exists := t.TrackMap[torrentHash]; !exists {
 				t.TrackMap[torrentHash] = &TorrentTrack{Peers: make(map[string]*PeerInfo)}
 			}
-			t.TrackMap[torrentHash].Peers[peerIP] = &PeerInfo{
+			t.TrackMap[torrentHash].Peers[peerID] = &PeerInfo{ // Usamos peerID
 				IP:             peerIP,
 				Port:           port,
 				Role:           role,
@@ -143,7 +143,7 @@ func (t *Tracker) handleConnection(conn net.Conn) {
 			}
 			t.mu.Unlock()
 
-			fmt.Printf("\n[*] Nodo %s:%d registrado en '%s' como %s\n", peerIP, port, torrentHash, role)
+			fmt.Printf("\n[*] Nodo %s registrado en '%s' como %s\n", peerID, torrentHash, role)
 		}
 
 	case GET_STATE:
@@ -161,15 +161,28 @@ func (t *Tracker) handleConnection(conn net.Conn) {
 // monitorNodes hace un chequeo de salud y estado a los nodos
 func (t *Tracker) monitorNodes() {
 	for {
-		time.Sleep(15 * time.Second) // Preguntará periódicamente
-		t.mu.RLock()
-		// Aquí iteraremos sobre TrackMap para enviar pings a los Peers
+		time.Sleep(15 * time.Second)
 
-		// Lectura temporal del mapa para quitar el warning de "sección vacía"
-		_ = len(t.TrackMap)
+		t.mu.Lock()
+		for hash, track := range t.TrackMap {
+			for peerID, peer := range track.Peers { // Iteramos usando peerID
+				address := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
+				conn, err := net.DialTimeout("tcp", address, 2*time.Second)
 
-		// y actualizar sus porcentajes o aplicar Tolerancia a Fallos
-		t.mu.RUnlock()
+				if err != nil {
+					fmt.Printf("\n[Tracker] Nodo %s desconectado. Limpiando registros...\n", address)
+					delete(t.activePorts, peer.Port)
+					delete(track.Peers, peerID) // Borramos usando peerID
+
+					if len(track.Peers) == 0 {
+						delete(t.TrackMap, hash)
+					}
+				} else {
+					conn.Close()
+				}
+			}
+		}
+		t.mu.Unlock()
 	}
 }
 
@@ -185,9 +198,10 @@ func (t *Tracker) cliDashboard() {
 		} else {
 			for hash, track := range t.TrackMap {
 				fmt.Printf("Torrent [Hash: %s]\n", hash)
-				for ip, peer := range track.Peers {
+				// Ignoramos la llave con '_' y usamos directamente los campos de peer
+				for _, peer := range track.Peers {
 					fmt.Printf(" -> Nodo [%s:%d] | Rol: %s | Progreso: %.2f%%\n",
-						ip, peer.Port, peer.Role, peer.DownloadStatus)
+						peer.IP, peer.Port, peer.Role, peer.DownloadStatus)
 				}
 			}
 		}
