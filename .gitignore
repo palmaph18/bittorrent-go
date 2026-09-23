@@ -1,0 +1,18 @@
+# Carpetas de datos y pruebas (ignora todo su contenido)
+archivos/*
+torrents/*
+
+# Excepciones si decides colocar un .gitkeep dentro para mantener las carpetas vacías
+!.gitkeep
+
+# Binarios compilados de Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Archivos de entorno y temporales
+*.env
+.DS_Store
