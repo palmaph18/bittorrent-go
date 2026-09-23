@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/md5"
 	"encoding/gob"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Peer representa la lógica principal del nodo
@@ -256,13 +259,12 @@ func (p *Peer) cliMenu() {
 	}
 }
 
-// startDownload conecta con un Seeder, solicita pedazos y aplica Tolerancia a Fallos
+// startDownload conecta con la red, descubre nodos y descarga concurrentemente
 func (p *Peer) startDownload(metadata *TorrentMetadata) {
-	fmt.Printf("\n[*] Iniciando descarga binaria del archivo: %s\n", metadata.FileName)
-	seederAddr := "127.0.0.1:4000"
+	fmt.Printf("\n[*] Iniciando descarga concurrente del archivo: %s\n", metadata.FileName)
 	totalPieces := len(metadata.PiecesHashes)
 
-	// 1. Cargar estado previo usando las funciones de tu connection.go
+	// 1. Cargar estado local previo
 	state, err := LoadProgress(metadata.FileName, totalPieces)
 	if err != nil {
 		fmt.Printf("[ERROR] No se pudo cargar el estado local: %v\n", err)
@@ -270,9 +272,40 @@ func (p *Peer) startDownload(metadata *TorrentMetadata) {
 	}
 
 	if state.ProgressStatus > 0 {
-		fmt.Printf("[*] Tolerancia a fallos activa: Retomando descarga desde el %.2f%%\n", state.ProgressStatus)
+		fmt.Printf("[*] Tolerancia a fallos: Retomando desde el %.2f%%\n", state.ProgressStatus)
 		p.UpdateProgress(state.ProgressStatus)
 	}
+
+	// 2. Consultar al Tracker por la lista dinámica de nodos (Descubrimiento)
+	var availablePeers []string
+	connTracker, err := net.Dial("tcp", p.TrackerAddr)
+	if err == nil {
+		msg := Message{Type: GET_STATE, Payload: []byte{}}
+		encTracker := gob.NewEncoder(connTracker)
+		encTracker.Encode(&msg)
+
+		decTracker := gob.NewDecoder(connTracker)
+		var resp Message
+		if err := decTracker.Decode(&resp); err == nil && resp.Type == STATE_RESPONSE {
+			var trackMap map[string]*TorrentTrack
+			json.Unmarshal(resp.Payload, &trackMap)
+			if track, ok := trackMap[metadata.FileName]; ok {
+				for _, peerInfo := range track.Peers {
+					// Agregamos a la lista de descargas si no somos nosotros mismos
+					if peerInfo.Port != p.Port {
+						availablePeers = append(availablePeers, fmt.Sprintf("%s:%d", peerInfo.IP, peerInfo.Port))
+					}
+				}
+			}
+		}
+		connTracker.Close()
+	}
+
+	if len(availablePeers) == 0 {
+		fmt.Println("\n[!] No hay otros nodos en la red compartiendo este archivo.")
+		return
+	}
+	fmt.Printf("[*] Descubiertos %d nodos. Iniciando enjambre P2P...\n", len(availablePeers))
 
 	destPath := filepath.Join("archivos", "descargado_"+metadata.FileName)
 	file, err := os.OpenFile(destPath, os.O_CREATE|os.O_RDWR, 0666)
@@ -281,65 +314,102 @@ func (p *Peer) startDownload(metadata *TorrentMetadata) {
 	}
 	defer file.Close()
 
-	conn, err := net.Dial("tcp", seederAddr)
-	if err != nil {
-		fmt.Printf("[ERROR] No se pudo conectar al Seeder: %v\n", err)
-		return
-	}
-	defer conn.Close()
-
-	encoder := gob.NewEncoder(conn)
-	decoder := gob.NewDecoder(conn)
-
-	// 2. Ciclo de descarga de pedazos
+	// 3. Preparar la concurrencia mediante Channels y WaitGroups
+	workQueue := make(chan int, totalPieces*2) // Canal seguro para encolar pedazos faltantes
 	for i := 0; i < totalPieces; i++ {
-		if state.Downloaded[i] {
-			continue // Saltar pedazos ya descargados (Tolerancia a fallos)
+		if !state.Downloaded[i] {
+			workQueue <- i
 		}
+	}
 
-		payload := fmt.Sprintf("%s|%d", metadata.FileName, i)
-		req := Message{Type: REQUEST_PIECE, Payload: []byte(payload)}
-		encoder.Encode(&req)
+	var wg sync.WaitGroup
+	var fileMutex sync.Mutex // Mutex para no escribir en disco simultáneamente
 
-		var resp Message
-		if err := decoder.Decode(&resp); err == nil && resp.Type == PIECE_DATA {
-			offset := int64(i * metadata.PieceLength)
-			file.WriteAt(resp.Payload, offset)
+	// Lanzar una goroutine trabajadora por cada peer descubierto
+	for _, peerAddr := range availablePeers {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
 
-			// Registrar pedazo y calcular progreso
-			state.Downloaded[i] = true
+			encoder := gob.NewEncoder(conn)
+			decoder := gob.NewDecoder(conn)
 
-			// Guardar el estado en disco usando tu función SaveProgress
-			SaveProgress(metadata.FileName, state.Downloaded, totalPieces)
+			for {
+				// Verificar de forma segura si ya terminamos toda la descarga
+				fileMutex.Lock()
+				completedCount := 0
+				for _, done := range state.Downloaded {
+					if done {
+						completedCount++
+					}
+				}
+				fileMutex.Unlock()
 
-			// Calcular progreso local iterando tu slice de booleanos
-			completed := 0
-			for _, done := range state.Downloaded {
-				if done {
-					completed++
+				if completedCount == totalPieces {
+					return // La goroutine muere pacíficamente porque el archivo está listo
+				}
+
+				// Extraer un trabajo (índice de pedazo) del canal
+				select {
+				case pieceIndex := <-workQueue:
+					payload := fmt.Sprintf("%s|%d", metadata.FileName, pieceIndex)
+					req := Message{Type: REQUEST_PIECE, Payload: []byte(payload)}
+					if err := encoder.Encode(&req); err != nil {
+						workQueue <- pieceIndex // Si falla la red, regresamos el pedazo a la cola
+						return
+					}
+
+					var resp Message
+					if err := decoder.Decode(&resp); err == nil && resp.Type == PIECE_DATA {
+						// Validación de Integridad MD5
+						hash := md5.Sum(resp.Payload)
+						if hex.EncodeToString(hash[:]) != metadata.PiecesHashes[pieceIndex] {
+							workQueue <- pieceIndex // Si el pedazo está corrupto, lo regresamos a la cola
+							continue
+						}
+
+						// Escritura atómica en disco y memoria
+						fileMutex.Lock()
+						if !state.Downloaded[pieceIndex] {
+							offset := int64(pieceIndex * metadata.PieceLength)
+							file.WriteAt(resp.Payload, offset)
+							state.Downloaded[pieceIndex] = true
+							SaveProgress(metadata.FileName, state.Downloaded, totalPieces)
+
+							progress := (float64(completedCount+1) / float64(totalPieces)) * 100
+							p.UpdateProgress(progress)
+						}
+						fileMutex.Unlock()
+					} else {
+						workQueue <- pieceIndex // Si falla la recepción, regresamos a la cola
+						return
+					}
+				default:
+					// Si la cola está momentáneamente vacía, la goroutine descansa una fracción de segundo
+					time.Sleep(100 * time.Millisecond)
 				}
 			}
-			progress := (float64(completed) / float64(totalPieces)) * 100
-			p.UpdateProgress(progress)
-		} else {
-			fmt.Println("\n[!] Conexión interrumpida con el Seeder.")
-			break // Romper ciclo si falla la red, el estado ya está guardado
-		}
+		}(peerAddr) // Pasamos la dirección por valor a la goroutine
 	}
 
-	// 3. Verificar si el archivo está completo para notificar al Tracker
+	wg.Wait() // Bloquea el hilo principal hasta que todas las goroutines finalicen o se desconecten
+
+	// 4. Verificación final y reporte
 	allDone := true
 	for _, done := range state.Downloaded {
 		if !done {
 			allDone = false
-			break
 		}
 	}
 
 	if allDone {
-		fmt.Printf("\n[*] ¡Descarga P2P completada! Archivo en: %s\n", destPath)
+		fmt.Printf("\n[*] ¡Descarga Concurrente P2P completada! Archivo en: %s\n", destPath)
 
-		// Conectar al Tracker para registrar el nuevo rol de Seeder público
 		connTracker, errTracker := net.Dial("tcp", p.TrackerAddr)
 		if errTracker == nil {
 			payload := fmt.Sprintf("%s|%d|%s|%.2f", metadata.FileName, p.Port, p.Role, p.DownloadStatus)
@@ -347,7 +417,9 @@ func (p *Peer) startDownload(metadata *TorrentMetadata) {
 			encTracker := gob.NewEncoder(connTracker)
 			encTracker.Encode(&msg)
 			connTracker.Close()
-			fmt.Println("[*] Tracker notificado: Ahora eres un Seeder público.")
+			fmt.Println("[*] Tracker notificado: Ahora eres un Seeder público en el enjambre.")
 		}
+	} else {
+		fmt.Println("\n[!] Descarga pausada. Se perdieron conexiones con los nodos fuente.")
 	}
 }
