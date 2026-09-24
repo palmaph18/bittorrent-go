@@ -6,32 +6,32 @@ import (
 )
 
 func main() {
-	// Verificamos que se haya pasado al menos un argumento
 	if len(os.Args) < 2 {
-		fmt.Println("Uso incorrecto. Debes especificar el modo de ejecución.")
-		fmt.Println("Ejemplo: go run . tracker")
-		fmt.Println("Ejemplo: go run . peer")
-		os.Exit(1)
+		fmt.Println("Uso: go run . <tracker|peer> [IP_DEL_TRACKER]")
+		return
 	}
 
 	mode := os.Args[1]
 
-	switch mode {
-	case "tracker":
-		// Iniciar el servidor centralizado (Capa de Monitoreo)
+	if mode == "tracker" {
+		// 0.0.0.0 permite que el Tracker reciba conexiones desde otras computadoras en la red LAN
+		fmt.Println("[*] Iniciando Tracker en 0.0.0.0:5000...")
 		tracker := NewTracker()
-		tracker.Start()
+		tracker.Start("0.0.0.0:5000") // Asegúrate de que este método coincida con el que ya tienes
+	} else if mode == "peer" {
+		trackerIP := "127.0.0.1" // Fallback local si no se pasa el argumento
 
-	case "peer":
-		// Iniciar un nodo actuando simultáneamente como cliente y servidor
-		// Como todo será local, apuntamos al puerto 5000 por defecto del Tracker
-		trackerAddr := "127.0.0.1:5000"
-		fmt.Printf("Iniciando nodo... Conectando al Tracker en %s\n", trackerAddr)
+		// Leer la IP de la otra computadora si se proporcionó en la terminal
+		if len(os.Args) >= 3 {
+			trackerIP = os.Args[2]
+		}
+
+		trackerAddr := fmt.Sprintf("%s:5000", trackerIP)
+		fmt.Printf("[*] Iniciando Peer... Apuntando al Tracker en %s\n", trackerAddr)
 
 		peer := NewPeer(trackerAddr)
-		peer.Start()
-
-	default:
-		fmt.Printf("Modo '%s' no reconocido. Usa 'tracker' o 'peer'.\n", mode)
+		peer.Start() // Asegúrate de que este método coincida con el que ya tienes
+	} else {
+		fmt.Println("[!] Modo no reconocido. Usa 'tracker' o 'peer'.")
 	}
 }

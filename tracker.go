@@ -63,15 +63,14 @@ func (t *Tracker) ReleasePeer(port int, peerIP string, torrentHash string) {
 }
 
 // Start iniciará el servidor (Sockets TCP)
-func (t *Tracker) Start() {
-	address := fmt.Sprintf(":%d", t.Port)
+func (t *Tracker) Start(address string) {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		log.Fatalf("Error al iniciar el Tracker: %v\n", err)
 	}
 	defer listener.Close()
 
-	fmt.Printf("\n=== Tracker Iniciado en el puerto %d ===\n", t.Port)
+	fmt.Printf("\n=== Tracker Iniciado en %s ===\n", address)
 
 	// Goroutine que preguntará periódicamente el estado de los nodos
 	go t.monitorNodes()
