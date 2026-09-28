@@ -241,9 +241,9 @@ func (p *Peer) cliMenu() {
 					} else {
 						for hash, track := range trackMap {
 							fmt.Printf("Torrent disponible: %s\n", hash)
-							for ip, peerInfo := range track.Peers {
+							for _, peerInfo := range track.Peers {
 								fmt.Printf(" -> Nodo [%s:%d] | Rol: %s | Progreso: %.2f%%\n",
-									ip, peerInfo.Port, peerInfo.Role, peerInfo.DownloadStatus)
+									peerInfo.IP, peerInfo.Port, peerInfo.Role, peerInfo.DownloadStatus)
 							}
 						}
 					}
